@@ -51,6 +51,8 @@ import sys
 import os
 import shutil
 from PIL import Image as PILImage
+# Set to a higher limit (e.g., 500 million pixels)
+PILImage.MAX_IMAGE_PIXELS = 500000000
 
 warnings.filterwarnings('ignore')
 
@@ -109,31 +111,41 @@ class SegmentationCorrectionPipeline:
     
     def __init__(self):
         # Define colormap and labels
-        self.colormap = np.array([
-            [214, 212, 161],  # 1 bone
-            [247, 184, 67],   # 2 brain + spinal cord
-            [136, 232, 95],   # 3 eye
-            [140, 13, 13],    # 4 heart
-            [38, 27, 166],    # 5 lungs
-            [13, 125, 11],    # 6 GI track 
-            [179, 50, 108],   # 7 liver
-            [228, 235, 131],  # 8 spleen
-            [156, 96, 235],   # 9 pancreas
-            [46, 190, 230],   # 10 kidney
-            [150, 255, 245],  # 11 mesokidney
-            [254, 222, 255],  # 12 collagen
-            [235, 154, 108],  # 13 ear
-            [255, 255, 255],  # 14 nontissue
-            [9, 64, 116],     # 15 thymus
-            [255, 255, 74],   # 16 thyroid
-            [178, 178, 0],    # 17 bladder
-            [214, 212, 161],  # 18 skull
-            [54, 83, 89]      # 19 spleen2
-        ]) / 255.0  # Normalize to 0-1 range
+        # self.colormap = np.array([
+        #     [214, 212, 161],  # 1 bone
+        #     [247, 184, 67],   # 2 brain + spinal cord
+        #     [136, 232, 95],   # 3 eye
+        #     [140, 13, 13],    # 4 heart
+        #     [38, 27, 166],    # 5 lungs
+        #     [13, 125, 11],    # 6 GI track 
+        #     [179, 50, 108],   # 7 liver
+        #     [228, 235, 131],  # 8 spleen
+        #     [156, 96, 235],   # 9 pancreas
+        #     [46, 190, 230],   # 10 kidney
+        #     [150, 255, 245],  # 11 mesokidney
+        #     [254, 222, 255],  # 12 collagen
+        #     [235, 154, 108],  # 13 ear
+        #     [255, 255, 255],  # 14 nontissue
+        #     [9, 64, 116],     # 15 thymus
+        #     [255, 255, 74],   # 16 thyroid
+        #     [178, 178, 0],    # 17 bladder
+        #     [214, 212, 161],  # 18 skull
+        #     [54, 83, 89]      # 19 spleen2
+        # ]) / 255.0  # Normalize to 0-1 range
         
-        self.label_names = ["bone", "brain", "eye", "heart", "lungs", "GI", "liver", 
-                           "spleen", "pancreas", "kidney", "mesokidney", "collagen", 
-                           "ear", "nontissue", "thymus", "thyroid", "bladder", "skull", "spleen2"]
+
+        self.colormap = np.array([
+            [254, 222, 255],  # 1 collagen
+            [255, 255, 255],  # 2 nontissue
+            [255, 0, 0]      # 3 blood vessels
+        ]) / 255.0  # Normalize to 0-1 range
+
+        # self.label_names = ["bone", "brain", "eye", "heart", "lungs", "GI", "liver", 
+        #                    "spleen", "pancreas", "kidney", "mesokidney", "collagen", 
+        #                    "ear", "nontissue", "thymus", "thyroid", "bladder", "skull", "spleen2"]
+        
+        self.label_names = ["collagen", "nontissue", "blood vessels"]
+        self.num_labels = len(self.colormap)
         
         # Initialize state variables
         self.segmented_stack: Optional[np.ndarray] = None
@@ -146,8 +158,8 @@ class SegmentationCorrectionPipeline:
         self.z_projection_depth: int = 5
         self._color_lut_uint8 = None  # Will be computed on first use
         self._dirty_regions = {}  # {image_idx: (y1, y2, x1, x2)}
-        # Exclude label 12 (collagen) from z-projection
-        self.z_projection_labels: Set[int] = set(range(1, 20)) - {12}
+        self.z_projection_labels: Set[int] = set(range(1, self.num_labels + 1))
+      
         
         # Change tracking - now stores only metadata for undo
         self.change_history: List[ChangeRecord] = []
@@ -200,6 +212,7 @@ class SegmentationCorrectionPipeline:
 
         # FIX 1: Track original box prompt frames per object
         self.sam2_box_prompt_original_frames: Dict[int, int] = {}
+
 
     def preview_folders(self, segmented_folder: str, original_folder: str) -> Tuple[int, List[str]]:
         """Preview folders to get image count and filenames without loading
@@ -533,21 +546,23 @@ class SegmentationCorrectionPipeline:
         if labels.ndim != 2:
             raise ValueError(f"Labels must be 2D, got shape {labels.shape}")
         
-        # Pre-compute the color LUT once if not already done
+        # FIXED: Dynamic LUT size based on actual number of labels
         if not hasattr(self, '_color_lut_uint8') or self._color_lut_uint8 is None:
-            self._color_lut_uint8 = np.zeros((20, 3), dtype=np.uint8)
+            # Create LUT with size = num_labels + 1 (for label 0)
+            self._color_lut_uint8 = np.zeros((self.num_labels + 1, 3), dtype=np.uint8)
             
-            # Make sure colormap exists
             if self.colormap is not None:
-                for i in range(min(len(self.colormap), 19)):  # Ensure we don't exceed bounds
+                # Fill colors for labels 1 to num_labels
+                for i in range(self.num_labels):
                     self._color_lut_uint8[i + 1] = (self.colormap[i] * 255).astype(np.uint8)
                 
-                # Special case: label 0 maps to same color as label 14 (background)
-                if len(self.colormap) >= 14:
-                    self._color_lut_uint8[0] = (self.colormap[13] * 255).astype(np.uint8)
+
+                # Option 2: Use white for background (pixels equal to 0)
+                self._color_lut_uint8[0] = np.array([255, 255, 255], dtype=np.uint8)
         
-        # Use fancy indexing (much faster than the original)
-        rgb_image = self._color_lut_uint8[labels]
+        # Clip labels to valid range before indexing
+        clipped_labels = np.clip(labels, 0, self.num_labels)
+        rgb_image = self._color_lut_uint8[clipped_labels]
         
         return rgb_image
     
@@ -2548,7 +2563,7 @@ class SegmentationCorrectionPipeline:
     
 
     def propagate_button_clicked(self, num_images: int, direction: str = "forward") -> None:
-        """FIXED: Handle Propagate button click with proper error recovery"""
+        """Handle Propagate button with proper forward/backward propagation logic"""
         if self.sam2_mode not in ["annotation", "refining"]:
             print("ERROR: Must click 'SAM2 Seg' first to set up square ROI and points")
             return
@@ -2563,7 +2578,7 @@ class SegmentationCorrectionPipeline:
         
         # Validate annotation state
         if not self.validate_annotation_state():
-            print("⚠️  Warning: Annotation state validation failed, attempting to continue...")
+            print("Warning: Annotation state validation failed, attempting to continue...")
         
         # Ensure current object is active if it has annotations
         obj_has_points = (self.current_sam2_object_id in self.point_annotations_by_object and 
@@ -2580,7 +2595,7 @@ class SegmentationCorrectionPipeline:
         
         # Determine images to process
         if self.sam2_mode == "refining":
-            print("🔧 REFINEMENT MODE: Processing images with annotations")
+            print("Refinement Mode: Processing images with annotations")
             images_with_points = set()
             for obj_id in self.active_object_ids:
                 if obj_id in self.point_annotations_by_object:
@@ -2592,17 +2607,33 @@ class SegmentationCorrectionPipeline:
             print(f"Refining segmentation on {len(images_to_process)} images: {images_to_process}")
         else:
             if direction == "forward":
-                print("🚀 FORWARD PROPAGATION")
+                print("Forward Propagation")
+                # Forward: current → current+1 → current+2 → ... → current+n-1
                 start_idx = self.current_index
                 end_idx = min(start_idx + num_images, len(self.original_stack))
                 images_to_process = list(range(start_idx, end_idx))
+                # Order: [current, current+1, current+2, ...] - already correct
+                
             else:  # backward
-                print("🔄 BACKWARD PROPAGATION")
+                print("Backward Propagation")
+                # Backward: current → current-1 → current-2 → ... → current-n+1
                 start_idx = max(0, self.current_index - num_images + 1)
                 end_idx = self.current_index + 1
-                images_to_process = list(range(start_idx, end_idx))
+                # Create range in REVERSE order for backward propagation
+                images_to_process = list(range(self.current_index, start_idx - 1, -1))
+                # Order: [current, current-1, current-2, ...] - reversed
             
-            print(f"Propagating SAM2 {direction} across {len(images_to_process)} images: {images_to_process}")
+            print(f"Propagating SAM2 {direction} across {len(images_to_process)} images")
+            print(f"Processing order: {images_to_process}")
+        
+        # Box prompts should be applied to CURRENT frame (first frame in processing order)
+        # For forward: current is first (index 0)
+        # For backward: current is also first (index 0) after reversal
+        for obj_id in self.active_object_ids:
+            if obj_id in self.sam2_box_prompts_by_object and self.sam2_box_prompts_by_object[obj_id]:
+                # Current frame is always first in processing order for both directions
+                self.sam2_box_prompt_original_frames[obj_id] = self.current_index
+                print(f"Object {obj_id}: Box prompt on frame {self.current_index} (first in processing order)")
         
         # Collect points per frame per object
         points_per_frame_per_object = {}
@@ -2619,9 +2650,8 @@ class SegmentationCorrectionPipeline:
         for obj_id in self.active_object_ids:
             if obj_id not in points_per_frame_per_object or not points_per_frame_per_object[obj_id]:
                 if obj_id in self.sam2_box_prompts_by_object and self.sam2_box_prompts_by_object[obj_id]:
-                    original_frame = self.sam2_box_prompt_original_frames.get(obj_id)
-                    if original_frame is not None and original_frame in images_to_process:
-                        points_per_frame_per_object[obj_id] = {original_frame: ([], [])}
+                    # Use current frame (first in processing order)
+                    points_per_frame_per_object[obj_id] = {self.current_index: ([], [])}
         
         # Final validation
         total_prompts = sum(len(frames) for frames in points_per_frame_per_object.values())
@@ -2633,7 +2663,8 @@ class SegmentationCorrectionPipeline:
             print("ERROR: No prompts found for any object. Add points or draw boxes.")
             return
         
-        print(f"📊 Processing: {len(self.active_object_ids)} objects, {total_prompts} frame annotations, {total_boxes} box prompts")
+        print(f"Processing: {len(self.active_object_ids)} objects, {total_prompts} annotations, {total_boxes} boxes")
+        print(f"Direction: {direction}, Starting frame: {self.current_index}")
         
         # Clear ROIs but preserve box prompts
         self.safely_clear_rois(preserve_prompts=True)
@@ -2644,18 +2675,18 @@ class SegmentationCorrectionPipeline:
             target_images=images_to_process,
             is_working_roi=True,
             edge_color='lime',
-            edge_width=4
+            edge_width=6
         )
         
-        # Extract image cutouts
-        print("🔍 Extracting ROI cutouts from ORIGINAL images...")
+        # Extract image cutouts IN THE ORDER they will be processed
+        print("Extracting ROI cutouts from ORIGINAL images...")
         image_cutouts = []
         for idx in images_to_process:
             original_image = self.original_stack[idx]
             cutout = self.extract_roi_as_jpeg(original_image, self.current_roi_params)
             image_cutouts.append(cutout)
         
-        # Run SAM2 processing with proper error handling
+        # Run SAM2 processing
         try:
             results_per_object = self.sam2_propagate_batch(
                 image_cutouts, 
@@ -2664,10 +2695,10 @@ class SegmentationCorrectionPipeline:
                 self.sam2_box_prompts_by_object
             )
             
-            print(f"✅ SAM2 processing completed for {len(results_per_object)} objects")
+            print(f"SAM2 processing completed for {len(results_per_object)} objects")
             
             # Convert masks to ROIs
-            all_rois = {}  # {image_idx: {obj_id: [roi_vertices]}}
+            all_rois = {}
             
             for obj_id, batch_results in results_per_object.items():
                 for i, (idx, masks) in enumerate(zip(images_to_process, batch_results)):
@@ -2683,27 +2714,25 @@ class SegmentationCorrectionPipeline:
             
             # Update mode
             if self.sam2_mode == "refining":
-                print(f"🔧 Refinement complete! Updated ROIs for {len(all_rois)} images.")
+                print(f"Refinement complete! Updated ROIs for {len(all_rois)} images.")
             else:
                 self.sam2_mode = "propagated"
-                print(f"🚀 {direction.capitalize()} propagation complete! Generated ROIs for {len(all_rois)} images.")
+                print(f"{direction.capitalize()} propagation complete! Generated ROIs for {len(all_rois)} images.")
             
-            print("\n📋 Next steps:")
+            print("\nNext steps:")
             print("1. Apply ROIs: Click 'Apply ROI Transfer' to transfer labels")
             print("2. Add more objects: Change Object ID and add new annotations") 
             print("3. Refine: Click 'Refine Seg' to improve existing objects")
             print("4. Clean up: Click 'Delete Seg' to start over")
             
         except Exception as e:
-            print(f"❌ ERROR in SAM2 propagation: {e}")
+            print(f"ERROR in SAM2 propagation: {e}")
             
-            # FIXED: Proper error recovery
             if hasattr(self, '_sam2_state'):
-                print("🔧 Clearing SAM2 state due to error")
+                print("Clearing SAM2 state due to error")
                 del self._sam2_state
             
-            # Allow user to retry
-            print("💡 Try reducing the number of images or simplifying annotations")
+            print("Try reducing the number of images or simplifying annotations")
             import traceback
             traceback.print_exc()
     
@@ -2742,7 +2771,7 @@ class SegmentationCorrectionPipeline:
                                 target_images=[img_idx],
                                 object_id=obj_id,  # Pass object ID for tracking
                                 edge_color=obj_color,
-                                edge_width=2,
+                                edge_width=5,
                                 face_color=[0, 0, 0, 0]
                             )
                             rois_added += 1
@@ -3493,7 +3522,6 @@ def create_gui(pipeline: SegmentationCorrectionPipeline) -> Container:
         checkbox = CheckBox(value=False)
         checkbox.text = f"{i+1}: {name}"
         
-        # Create closure for checkbox connection
         def make_callback(idx):
             def callback(val):
                 if val:
@@ -3505,7 +3533,7 @@ def create_gui(pipeline: SegmentationCorrectionPipeline) -> Container:
         
         checkbox.changed.connect(make_callback(i + 1))
         label_checkboxes.append(checkbox)
-    
+
     # Organize labels into 4 efficient columns (19 labels: 5,5,5,4 distribution)
     column1_labels = label_checkboxes[0:5]    # Labels 1-5
     column2_labels = label_checkboxes[5:10]   # Labels 6-10  
@@ -3546,13 +3574,12 @@ def create_gui(pipeline: SegmentationCorrectionPipeline) -> Container:
     
     # Transfer label selection
     transfer_combo = ComboBox(
-        choices=[f"{i}: {pipeline.label_names[i-1]}" for i in range(1, 20)],
-        value="1: bone",
+        choices=[f"{i}: {pipeline.label_names[i-1]}" for i in range(1, pipeline.num_labels + 1)],
+        value=f"1: {pipeline.label_names[0]}",
         name="Transfer to label"
     )
     
     def update_transfer_label(value):
-        # Extract label number from string
         label_num = int(value.split(":")[0])
         pipeline.transfer_label = label_num
         print(f"Transfer target set to label {label_num}")
