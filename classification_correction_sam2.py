@@ -50,9 +50,11 @@ import tempfile
 import sys
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from PIL import Image as PILImage
 # Set to a higher limit (e.g., 500 million pixels)
-PILImage.MAX_IMAGE_PIXELS = 500000000
+PILImage.MAX_IMAGE_PIXELS = None
 
 warnings.filterwarnings('ignore')
 
@@ -96,6 +98,52 @@ class ChangeRecord:
     target_label: int
     affected_pixels: int
 
+
+
+def _process_single_mask_worker_threaded(mask_data: Tuple[np.ndarray, int, Dict[str, int], Tuple[int, int], float, int]) -> Tuple[int, Optional[np.ndarray]]:
+    """Thread-safe worker function (no fork issues with Qt/napari)
+    
+    OpenCV releases the GIL during contour operations, so threading is efficient here.
+    """
+    mask, frame_idx, crop_params, original_shape, detail_level, obj_id = mask_data
+    
+    if mask is None or not mask.any():
+        return (frame_idx, None)
+    
+    try:
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return (frame_idx, None)
+        
+        largest_contour = max(contours, key=cv2.contourArea)
+        contour_area = cv2.contourArea(largest_contour)
+        
+        if contour_area < 10:
+            return (frame_idx, None)
+        
+        perimeter = cv2.arcLength(largest_contour, True)
+        epsilon = detail_level * 0.01 * perimeter
+        approx_polygon = cv2.approxPolyDP(largest_contour, epsilon, True)
+        sampled_points = approx_polygon.reshape(-1, 2)
+        
+        if len(sampled_points) < 3:
+            return (frame_idx, None)
+        
+        y_offset = crop_params['top_left_y']
+        x_offset = crop_params['top_left_x']
+        
+        global_points_yx = np.column_stack((
+            sampled_points[:, 1] + y_offset,
+            sampled_points[:, 0] + x_offset
+        ))
+        
+        return (frame_idx, global_points_yx.astype(np.float64))
+        
+    except Exception as e:
+        return (frame_idx, None)
+    
 
 @dataclass
 class PointAnnotation:
@@ -2398,59 +2446,29 @@ class SegmentationCorrectionPipeline:
                 print(f"Warning: Could not clean up temp directory: {e}")
 
     
+
     def convert_masks_to_rois(self, masks: List[np.ndarray], 
-                            roi_params: Dict[str, int]) -> List[np.ndarray]:
-        """Convert binary masks to ROI polygons in global coordinates
+                            roi_params: Dict[str, int],
+                            detail_level: float = 0.3) -> List[np.ndarray]:
+        """Convert binary masks to ROI polygons - wrapper for parallel processing
         
         Args:
-            masks: List of binary segmentation masks in local ROI space
+            masks: List of binary segmentation masks
             roi_params: ROI parameters for coordinate conversion
+            detail_level: Level of detail (0.1=very detailed, 0.3=medium, 0.5=simple)
             
         Returns:
             List of ROI vertex arrays in global coordinates
         """
-        print(f"Converting {len(masks)} masks to ROI polygons")
+        # Wrap in single object dict for parallel processing
+        masks_dict = {1: masks}
+        results = self.convert_masks_to_rois_parallel(masks_dict, roi_params, detail_level)
         
-        rois = []
-        for i, mask in enumerate(masks):
-            if mask is None or not mask.any():
-                print(f"  Mask {i}: Empty or None, skipping")
-                continue
-                
-            # Get original image shape (use current stack dimensions)
-            if self.original_stack is not None:
-                original_shape = self.original_stack.shape[1:3]  # (height, width)
-            else:
-                # Fallback - estimate from ROI params
-                original_shape = (
-                    roi_params['top_left_y'] + roi_params['height'] + 100,
-                    roi_params['top_left_x'] + roi_params['width'] + 100
-                )
-            
-            # Extract contour points from mask
-            roi_vertices = self.extract_convex_hull_from_mask_batch(
-                mask, i, roi_params, original_shape
-            )
-            
-            if roi_vertices is not None:
-                # Validate the ROI vertices
-                if roi_vertices.shape[1] != 2:
-                    print(f"  Warning: Invalid ROI vertices shape {roi_vertices.shape} for mask {i}")
-                    continue
-                
-                if len(roi_vertices) < 3:
-                    print(f"  Warning: ROI has too few vertices ({len(roi_vertices)}) for mask {i}")
-                    continue
-                
-                # Ensure proper data type
-                roi_vertices = roi_vertices.astype(np.float64)
-                rois.append(roi_vertices)
-                print(f"  Mask {i}: Generated ROI with {len(roi_vertices)} vertices")
-            else:
-                print(f"  Mask {i}: Could not extract valid ROI vertices")
-        
-        print(f"Successfully converted {len(rois)} masks to ROI polygons")
-        return rois
+        # Extract just the ROI vertices (ignore image indices for single-object case)
+        if 1 in results:
+            return [roi for _, roi in results[1]]
+        return []
+
     
     # ============================================================================
     # SAM2 INTEGRATION - MAIN WORKFLOW FUNCTIONS
@@ -2608,30 +2626,22 @@ class SegmentationCorrectionPipeline:
         else:
             if direction == "forward":
                 print("Forward Propagation")
-                # Forward: current → current+1 → current+2 → ... → current+n-1
                 start_idx = self.current_index
                 end_idx = min(start_idx + num_images, len(self.original_stack))
                 images_to_process = list(range(start_idx, end_idx))
-                # Order: [current, current+1, current+2, ...] - already correct
                 
             else:  # backward
                 print("Backward Propagation")
-                # Backward: current → current-1 → current-2 → ... → current-n+1
                 start_idx = max(0, self.current_index - num_images + 1)
                 end_idx = self.current_index + 1
-                # Create range in REVERSE order for backward propagation
                 images_to_process = list(range(self.current_index, start_idx - 1, -1))
-                # Order: [current, current-1, current-2, ...] - reversed
             
             print(f"Propagating SAM2 {direction} across {len(images_to_process)} images")
             print(f"Processing order: {images_to_process}")
         
         # Box prompts should be applied to CURRENT frame (first frame in processing order)
-        # For forward: current is first (index 0)
-        # For backward: current is also first (index 0) after reversal
         for obj_id in self.active_object_ids:
             if obj_id in self.sam2_box_prompts_by_object and self.sam2_box_prompts_by_object[obj_id]:
-                # Current frame is always first in processing order for both directions
                 self.sam2_box_prompt_original_frames[obj_id] = self.current_index
                 print(f"Object {obj_id}: Box prompt on frame {self.current_index} (first in processing order)")
         
@@ -2650,7 +2660,6 @@ class SegmentationCorrectionPipeline:
         for obj_id in self.active_object_ids:
             if obj_id not in points_per_frame_per_object or not points_per_frame_per_object[obj_id]:
                 if obj_id in self.sam2_box_prompts_by_object and self.sam2_box_prompts_by_object[obj_id]:
-                    # Use current frame (first in processing order)
                     points_per_frame_per_object[obj_id] = {self.current_index: ([], [])}
         
         # Final validation
@@ -2697,27 +2706,33 @@ class SegmentationCorrectionPipeline:
             
             print(f"SAM2 processing completed for {len(results_per_object)} objects")
             
-            # Convert masks to ROIs
-            all_rois = {}
-            
-            for obj_id, batch_results in results_per_object.items():
-                for i, (idx, masks) in enumerate(zip(images_to_process, batch_results)):
-                    if masks:
-                        rois = self.convert_masks_to_rois(masks, self.current_roi_params)
-                        if idx not in all_rois:
-                            all_rois[idx] = {}
-                        all_rois[idx][obj_id] = rois
-                        self.propagated_images.add(idx)
-            
+            # Convert masks to ROIs in parallel
+            print("Converting masks to ROIs (parallel processing)...")
+            all_rois_dict = self.convert_masks_to_rois_parallel(
+                results_per_object,
+                images_to_process, 
+                self.current_roi_params,
+                detail_level=0.3
+            )
+
+            # Update propagated images tracking
+            for obj_id, rois_list in all_rois_dict.items():
+                for img_idx, _ in rois_list:
+                    self.propagated_images.add(img_idx)
+
             # Process results
-            self.process_sam2_results_multi_object(all_rois)
+            self.process_sam2_results_multi_object_optimized(all_rois_dict)
+            
+            # Calculate total ROIs for reporting
+            total_rois = sum(len(rois_list) for rois_list in all_rois_dict.values())
+            unique_images = len(set(img_idx for rois_list in all_rois_dict.values() for img_idx, _ in rois_list))
             
             # Update mode
             if self.sam2_mode == "refining":
-                print(f"Refinement complete! Updated ROIs for {len(all_rois)} images.")
+                print(f"Refinement complete! Updated {total_rois} ROIs across {unique_images} images.")
             else:
                 self.sam2_mode = "propagated"
-                print(f"{direction.capitalize()} propagation complete! Generated ROIs for {len(all_rois)} images.")
+                print(f"{direction.capitalize()} propagation complete! Generated {total_rois} ROIs across {unique_images} images.")
             
             print("\nNext steps:")
             print("1. Apply ROIs: Click 'Apply ROI Transfer' to transfer labels")
@@ -2735,59 +2750,163 @@ class SegmentationCorrectionPipeline:
             print("Try reducing the number of images or simplifying annotations")
             import traceback
             traceback.print_exc()
-    
 
-    def process_sam2_results_multi_object(self, sam2_rois: Dict[int, Dict[int, List[np.ndarray]]]) -> None:
-        """Process ROIs from multiple objects with different colors and proper tracking
+
+    def convert_masks_to_rois_parallel(self, masks_per_object: Dict[int, List[List[np.ndarray]]], 
+                                    images_to_process: List[int],  # ADD THIS
+                                    roi_params: Dict[str, int],
+                                    detail_level: float = 0.3,
+                                    max_workers: int = 4) -> Dict[int, List[Tuple[int, np.ndarray]]]:
+        """Parallel conversion using threads only (no multiprocessing)
         
         Args:
-            sam2_rois: {image_idx: {obj_id: [roi_vertices]}}
+            masks_per_object: {object_id: [[mask1], [mask2], ...]} from SAM2
+            images_to_process: List of actual image indices in processing order
+            roi_params: ROI parameters for coordinate conversion
+            detail_level: Level of detail (0.1=very detailed, 0.5=medium, 1.0=simple)
+            max_workers: Number of threads (default 4, safe for Qt)
+            
+        Returns:
+            Dictionary mapping object_id to list of (image_idx, roi_vertices) tuples
+        """
+        # Get original image shape
+        if self.original_stack is not None:
+            original_shape = self.original_stack.shape[1:3]
+        else:
+            original_shape = (
+                roi_params['top_left_y'] + roi_params['height'] + 100,
+                roi_params['top_left_x'] + roi_params['width'] + 100
+            )
+        
+        # Flatten all masks into one batch
+        all_mask_data = []
+        object_mask_ranges = {}
+        current_idx = 0
+        
+        for obj_id, masks_list in masks_per_object.items():
+            start_idx = current_idx
+            
+            # FIX: Use actual image indices from images_to_process
+            for list_idx, mask_container in enumerate(masks_list):
+                if mask_container is None or len(mask_container) == 0:
+                    continue
+                
+                # Map list position to actual image index
+                actual_image_idx = images_to_process[list_idx] if list_idx < len(images_to_process) else list_idx
+                
+                actual_mask = mask_container[0] if isinstance(mask_container, list) else mask_container
+                
+                if actual_mask is None or not isinstance(actual_mask, np.ndarray) or not actual_mask.any():
+                    continue
+                
+                all_mask_data.append(
+                    (actual_mask, actual_image_idx, roi_params, original_shape, detail_level, obj_id)  # Use actual_image_idx
+                )
+                current_idx += 1
+            
+            object_mask_ranges[obj_id] = (start_idx, current_idx)
+        
+        total_masks = len(all_mask_data)
+        
+        if total_masks == 0:
+            print("No valid masks to process")
+            return {obj_id: [] for obj_id in masks_per_object.keys()}
+        
+        print(f"Converting {total_masks} masks to ROIs ({max_workers} threads, detail={detail_level})...")
+        
+        results = [None] * total_masks
+        
+        # Process with ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process_single_mask_worker_threaded, data): idx
+                for idx, data in enumerate(all_mask_data)
+            }
+            
+            processed = 0
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result(timeout=30)
+                except Exception as e:
+                    print(f"  Warning: Mask {idx} failed: {e}")
+                    results[idx] = None
+                
+                processed += 1
+                if processed % 50 == 0:
+                    print(f"  Progress: {processed}/{total_masks}")
+        
+        # Organize results by object
+        results_per_object = {}
+        for obj_id, (start_idx, end_idx) in object_mask_ranges.items():
+            obj_results = []
+            for result in results[start_idx:end_idx]:
+                if result is not None:
+                    frame_idx, roi_vertices = result
+                    if roi_vertices is not None:
+                        obj_results.append((frame_idx, roi_vertices))
+            
+            results_per_object[obj_id] = obj_results
+            print(f"  Object {obj_id}: {len(obj_results)} ROIs")
+        
+        total_rois = sum(len(r) for r in results_per_object.values())
+        print(f"Complete: {total_masks} masks -> {total_rois} ROIs")
+        
+        return results_per_object
+
+
+    def process_sam2_results_multi_object_optimized(self, sam2_rois_per_object: Dict[int, List[Tuple[int, np.ndarray]]]) -> None:
+        """Process ROIs from multiple objects with optimized adding
+        
+        Args:
+            sam2_rois_per_object: {object_id: [(image_idx, roi_vertices), ...]}
         """
         if self.shapes_layer is None:
             print("No shapes layer available")
             return
         
-        # Define colors for different objects
         object_colors = [
             'cyan', 'magenta', 'yellow', 'orange', 'purple', 'pink', 'brown', 'gray'
         ]
         
         try:
-            total_rois = 0
+            total_rois = sum(len(rois) for rois in sam2_rois_per_object.values())
             rois_added = 0
             
-            for img_idx, objects_data in sam2_rois.items():
-                for obj_id, roi_list in objects_data.items():
-                    # Get color for this object
-                    color_idx = (obj_id - 1) % len(object_colors)
-                    obj_color = object_colors[color_idx]
-                    
-                    for roi_idx, roi in enumerate(roi_list):
-                        total_rois += 1
-                        try:
-                            # Add ROI with proper object tracking
-                            self.safely_add_roi(
-                                roi,
-                                target_images=[img_idx],
-                                object_id=obj_id,  # Pass object ID for tracking
-                                edge_color=obj_color,
-                                edge_width=5,
-                                face_color=[0, 0, 0, 0]
-                            )
-                            rois_added += 1
-                            print(f"  Added ROI for Object {obj_id} on image {img_idx+1} ({len(roi)} vertices, {obj_color})")
-                        except Exception as e:
-                            print(f"  Warning: Could not add ROI for Object {obj_id}: {e}")
+            print(f"Adding {total_rois} ROIs to viewer...")
+            
+            # Batch add ROIs for better performance
+            for obj_id, rois_list in sam2_rois_per_object.items():
+                color_idx = (obj_id - 1) % len(object_colors)
+                obj_color = object_colors[color_idx]
+                
+                for img_idx, roi in rois_list:
+                    try:
+                        self.safely_add_roi(
+                            roi,
+                            target_images=[img_idx],
+                            object_id=obj_id,
+                            edge_color=obj_color,
+                            edge_width=5,
+                            face_color=[0, 0, 0, 0]
+                        )
+                        rois_added += 1
+                        
+                        if rois_added % 50 == 0:
+                            print(f"  Added {rois_added}/{total_rois} ROIs...")
+                            
+                    except Exception as e:
+                        print(f"  Warning: Could not add ROI for Object {obj_id}: {e}")
             
             print(f"Successfully added {rois_added}/{total_rois} ROIs from SAM2")
-            
-            # Validate final state
             self.validate_annotation_state()
             
         except Exception as e:
-            print(f"ERROR in process_sam2_results_multi_object: {e}")
+            print(f"ERROR in process_sam2_results_multi_object_optimized: {e}")
             import traceback
             traceback.print_exc()
+
+
 
 
     def refine_seg_button_clicked(self) -> None:
